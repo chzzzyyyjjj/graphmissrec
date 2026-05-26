@@ -22,7 +22,7 @@ learning_rate: 0.001
 neg_sampling:
   uniform: 1
 eval_step: 1
-stopping_step: 10
+stopping_step: 50
 clip_grad_norm: ~
 # clip_grad_norm:  {'max_norm': 5, 'norm_type': 2}
 weight_decay: 0.0

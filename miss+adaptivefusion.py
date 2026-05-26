@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,8 +11,28 @@ class MISSRec(Transformer):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
-        self.best_item_embedding_path = os.path.join(config['data_path'], 'item_embedding.npy')
-        self._init_interest_graph_fusion()
+        # Graph information is used through adaptive weighted fusion with the
+        # original MISSRec item semantics.
+        try:
+            import numpy as np
+            import os
+            emb_path = '/mnt/data/zyj/MM23-MISSRec/dataset/downstream/Scientific_mm_full/best_item_embedding.npy'
+            if os.path.exists(emb_path):
+                lightgcn_emb = np.load(emb_path)
+                if lightgcn_emb.shape[0] == self.n_items:
+                    lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()
+                elif lightgcn_emb.shape[0] == self.n_items - 1:
+                    lightgcn_tensor = torch.from_numpy(
+                        np.concatenate([np.zeros((1, lightgcn_emb.shape[1])), lightgcn_emb], axis=0)
+                    ).float()
+                else:
+                    lightgcn_tensor = torch.zeros(self.n_items, self.hidden_size)
+                
+                self.graph_adapter = nn.Linear(lightgcn_tensor.shape[1], self.hidden_size)
+                self.graph_gate = nn.Linear(self.hidden_size * 2, 1)
+                self.register_buffer('lightgcn_graph_emb', lightgcn_tensor)
+        except Exception as e:
+            print("Failed to load LightGCN embeddings:", e)
 
         self.train_stage = config['train_stage']
         self.temperature = config['temperature']
@@ -33,8 +52,6 @@ class MISSRec(Transformer):
 
         if self.train_stage in ['pretrain', 'inductive_ft']:
             self.item_embedding = None
-        else:
-            self._init_item_embedding_from_npy()
         # for `transductive_ft`, `item_embedding` is defined in SASRec base model
         if self.train_stage in ['inductive_ft', 'transductive_ft']:
             # NOTE: `plm_embedding` in pre-train stage will be carried via dataloader
@@ -55,117 +72,37 @@ class MISSRec(Transformer):
             self.knn_local_size = max(math.ceil(all_num_embeddings * config["knn_local_ratio"]), 1)
             self.register_buffer('interest_embeddings', torch.zeros(self.num_interest + 1, config['hidden_size'], dtype=torch.float))
 
-        if 'text' in self.modal_type and 'img' in self.modal_type:
-            if self.item_mm_fusion == 'dynamic_shared':
-                self.fusion_factor = nn.Parameter(data=torch.tensor(0, dtype=torch.float))
-            elif self.item_mm_fusion == 'dynamic_instance':
-                self.fusion_factor = nn.Parameter(data=torch.zeros(self.n_items, dtype=torch.float))
-
         if 'text' in self.modal_type:
             self.text_adaptor = nn.Linear(config['plm_size'], config['hidden_size'])
 
         if 'img' in self.modal_type:
             self.img_adaptor = nn.Linear(config['img_size'], config['hidden_size'])
 
-    def _get_best_item_embedding_path(self):
-        return self.best_item_embedding_path
-
-    def _init_item_embedding_from_npy(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path) or self.item_embedding is None:
-                return
-
-            lightgcn_emb = np.load(emb_path)
-            copy_dim = min(lightgcn_emb.shape[1], self.item_embedding.weight.size(1))
-            lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()[:, :copy_dim]
-            with torch.no_grad():
-                if lightgcn_emb.shape[0] == self.n_items:
-                    self.item_embedding.weight.data[:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy.")
-                elif lightgcn_emb.shape[0] == self.n_items - 1:
-                    self.item_embedding.weight.data[1:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy (with padding offset).")
-                else:
-                    print(f"LightGCN nodes ({lightgcn_emb.shape[0]}) != n_items ({self.n_items})")
-        except Exception as e:
-            print("Failed to load or apply LightGCN embeddings:", e)
-
-    def _init_interest_graph_fusion(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path):
-                return
-
-            graph_emb = np.load(emb_path)
-            if graph_emb.shape[0] == self.n_items:
-                graph_tensor = torch.from_numpy(graph_emb).float()
-            elif graph_emb.shape[0] == self.n_items - 1:
-                pad_emb = np.zeros((1, graph_emb.shape[1]), dtype=graph_emb.dtype)
-                graph_tensor = torch.from_numpy(np.concatenate([pad_emb, graph_emb], axis=0)).float()
-            else:
-                print(f"Graph embedding nodes ({graph_emb.shape[0]}) != n_items ({self.n_items}); skip Interest-level Graph Fusion.")
-                return
-
-            self.register_buffer('interest_graph_item_emb', graph_tensor)
-            if graph_tensor.shape[1] != self.hidden_size:
-                self.interest_graph_adapter = nn.Linear(graph_tensor.shape[1], self.hidden_size)
-                self._init_weights(self.interest_graph_adapter)
-
-            self.interest_graph_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
-            self._init_weights(self.interest_graph_gate)
-            self.interest_graph_scale = nn.Parameter(torch.tensor(-2.0, dtype=torch.float))
-        except Exception as e:
-            print("Failed to load graph embeddings for Interest-level Graph Fusion:", e)
-
-    def _get_interest_graph_item_emb(self, item_seq):
-        if not hasattr(self, 'interest_graph_item_emb'):
+    def _get_graph_item_embeddings(self, item_ids=None):
+        if not hasattr(self, 'lightgcn_graph_emb') or not hasattr(self, 'graph_adapter'):
             return None
 
-        graph_emb = self.interest_graph_item_emb[item_seq]
-        if hasattr(self, 'interest_graph_adapter'):
-            graph_emb = self.interest_graph_adapter(graph_emb)
-        graph_emb = F.normalize(graph_emb, dim=-1)
-        return graph_emb * (item_seq != 0).unsqueeze(-1).float()
+        graph_emb = self.lightgcn_graph_emb if item_ids is None else self.lightgcn_graph_emb[item_ids]
+        graph_emb = self.graph_adapter(graph_emb)
+        if item_ids is not None:
+            graph_emb = graph_emb * (item_ids != 0).unsqueeze(-1).float()
+        elif graph_emb.size(0) > 0:
+            graph_emb = graph_emb.clone()
+            graph_emb[0] = 0
+        return graph_emb
 
-    def _fuse_interest_graph(self, item_seq, interest_seq, interest_emb):
-        graph_emb = self._get_interest_graph_item_emb(item_seq)
-        if graph_emb is None or interest_emb is None:
-            return interest_emb
+    def _adaptive_graph_fusion(self, base_emb, item_ids=None):
+        if not torch.is_tensor(base_emb):
+            return base_emb
+        graph_emb = self._get_graph_item_embeddings(item_ids)
+        if graph_emb is None:
+            return base_emb
+        if graph_emb.shape != base_emb.shape:
+            return base_emb
 
-        item_padding_mask = (item_seq == 0).unsqueeze(1)
-        attn_score = torch.matmul(interest_emb, graph_emb.transpose(1, 2))
-        attn_score = attn_score.masked_fill(item_padding_mask, float('-inf'))
-        attn_weight = F.softmax(attn_score, dim=-1)
-        attn_weight = torch.nan_to_num(attn_weight, nan=0.0)
-
-        graph_confidence = (attn_weight.max(dim=-1, keepdim=True)[0])
-
-        graph_interest = torch.matmul(attn_weight, graph_emb)
-        graph_interest = F.normalize(graph_interest, dim=-1)
-
-        valid_item_count = (item_seq != 0).sum(-1).clamp(min=2).float()
-        max_entropy = valid_item_count.log().view(-1, 1, 1)
-        attn_entropy = -(attn_weight * torch.log(attn_weight.clamp_min(1e-12))).sum(-1, keepdim=True)
-        interest_uncertainty = (attn_entropy / max_entropy).clamp(0.0, 1.0)
-
-        adaptive_weight = interest_uncertainty * graph_confidence
-
-        gate = torch.sigmoid(self.interest_graph_gate(torch.cat([interest_emb, graph_interest], dim=-1)))
-        scale = torch.sigmoid(self.interest_graph_scale)
-        #fused_interest_emb = interest_emb + scale * interest_uncertainty * gate * graph_interest
-
-        fused_interest_emb =interest_emb+ scale* adaptive_weight* gate* graph_interest
-
-        if interest_seq is not None:
-            fused_interest_emb = fused_interest_emb * (interest_seq != 0).unsqueeze(-1).float()
-        return fused_interest_emb
+        gate_input = torch.cat([base_emb, graph_emb], dim=-1)
+        gate = torch.sigmoid(self.graph_gate(gate_input))
+        return base_emb + gate * graph_emb
 
     def get_encoder_attention_mask(self, dec_input_seq=None, is_casual=True):
         """memory_mask: [BxL], dec_input_seq: [BxNq]"""
@@ -198,7 +135,6 @@ class MISSRec(Transformer):
     # def forward(self, enc_item_seq, item_emb, item_modal_empty_mask, item_seq_len, dec_input_seq=None, dec_input_emb=None, dec_inp_seq_len=None):
     def forward(self, item_seq, item_emb, item_modal_empty_mask, item_seq_len, interest_seq=None, interest_emb=None, interest_seq_len=None):
         # encoder input
-        interest_emb = self._fuse_interest_graph(item_seq, interest_seq, interest_emb)
         enc_input_emb = interest_emb
         src_attn_mask, src_key_padding_mask = self.get_encoder_attention_mask(interest_seq, is_casual=False)
 
@@ -243,12 +179,15 @@ class MISSRec(Transformer):
         if 'img' in self.modal_type:
             pos_img_emb = self.img_adaptor(interaction['pos_img_emb'])
         if 'text' in self.modal_type and 'img' in self.modal_type: # weighted fusion
-            logits = self._compute_dynamic_fused_logits(seq_output, pos_text_emb, pos_img_emb) / self.temperature
+            candidate_item_ids = interaction[self.POS_ITEM_ID] if self.POS_ITEM_ID in interaction else None
+            logits = self._compute_dynamic_fused_logits(seq_output, pos_text_emb, pos_img_emb, candidate_item_ids) / self.temperature
         else: # single modality or no modality
             if 'text' in self.modal_type:
                 pos_item_emb = pos_text_emb
             if 'img' in self.modal_type:
                 pos_item_emb = pos_img_emb
+            candidate_item_ids = interaction[self.POS_ITEM_ID] if self.POS_ITEM_ID in interaction else None
+            pos_item_emb = self._adaptive_graph_fusion(pos_item_emb, candidate_item_ids)
             pos_item_emb = F.normalize(pos_item_emb, dim=1)
             logits = torch.matmul(seq_output, pos_item_emb.transpose(0, 1)) / self.temperature
         loss = F.cross_entropy(logits, batch_labels)
@@ -328,6 +267,8 @@ class MISSRec(Transformer):
             # interest_seq_list.append(img_interest_seq)
         if self.seq_mm_fusion != 'add':
             item_emb_list = torch.stack(item_emb_list, dim=1) # [BxMxLxD]
+        else:
+            item_emb_list = self._adaptive_graph_fusion(item_emb_list, item_seq)
         item_modal_empty_mask = torch.stack(item_modal_empty_mask_list, dim=1) # [BxMxL]
 
         seq_output, interest_orthogonal_regularization = self.forward(
@@ -372,6 +313,8 @@ class MISSRec(Transformer):
             interest_seq_list.append(img_interest_seq)
         if self.seq_mm_fusion != 'add':
             item_emb_list = torch.stack(item_emb_list, dim=1) # [BxMxLxD]
+        else:
+            item_emb_list = self._adaptive_graph_fusion(item_emb_list, item_seq)
         item_modal_empty_mask = torch.stack(item_modal_empty_mask_list, dim=1) # [BxMxL]
 
         # deduplication
@@ -411,20 +354,16 @@ class MISSRec(Transformer):
         if self.train_stage == 'transductive_ft':
             if self.id_type != 'none':
                 test_item_emb = test_item_emb + self.item_embedding.weight
+        test_item_emb = self._adaptive_graph_fusion(test_item_emb)
 
         test_item_emb = F.normalize(test_item_emb, dim=1)
         return test_item_emb
 
-    def _compute_dynamic_fused_logits(self, seq_output, text_emb, img_emb):
-        text_emb = F.normalize(text_emb, dim=1)
-        img_emb = F.normalize(img_emb, dim=1)
-        text_logits = torch.matmul(seq_output, text_emb.transpose(0, 1)) # [BxB]
-        img_logits = torch.matmul(seq_output, img_emb.transpose(0, 1)) # [BxB]
-        modality_logits = torch.stack([text_logits, img_logits], dim=-1) # [BxBx2]
-        if self.item_mm_fusion in ['dynamic_shared', 'dynamic_instance']:
-            agg_logits = (modality_logits * F.softmax(modality_logits * self.fusion_factor.unsqueeze(-1), dim=-1)).sum(dim=-1) # [BxBx2] => [BxB]
-        else: # 'static'
-            agg_logits = modality_logits.mean(dim=-1) # [BxBx2] => [BxB]
+    def _compute_dynamic_fused_logits(self, seq_output, text_emb, img_emb, candidate_item_ids=None):
+        base_emb = text_emb + img_emb
+        fused_emb = self._adaptive_graph_fusion(base_emb, candidate_item_ids)
+        fused_emb = F.normalize(fused_emb, dim=1)
+        agg_logits = torch.matmul(seq_output, fused_emb.transpose(0, 1))
         if self.train_stage == 'transductive_ft':
             if self.id_type != 'none':
                 test_id_emb = F.normalize(self.item_embedding.weight, dim=1)
@@ -441,6 +380,7 @@ class MISSRec(Transformer):
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
 
         seq_output, interest_orthogonal_regularization = self._compute_seq_embeddings(item_seq, item_seq_len)
+        
         if 'text' in self.modal_type and 'img' in self.modal_type: # weighted fusion
             test_text_emb = self.text_adaptor(self.plm_embedding.weight)
             test_img_emb = self.img_adaptor(self.img_embedding.weight)
@@ -458,6 +398,7 @@ class MISSRec(Transformer):
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
 
         seq_output, _ = self._compute_seq_embeddings(item_seq, item_seq_len)
+        
         if 'text' in self.modal_type and 'img' in self.modal_type: # weighted fusion
             test_text_emb = self.text_adaptor(self.plm_embedding.weight)
             test_img_emb = self.img_adaptor(self.img_embedding.weight)

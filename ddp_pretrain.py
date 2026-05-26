@@ -48,6 +48,7 @@ def pretrain(rank, world_size, dataset, **kwargs):
     # model pre-training
     trainer.pretrain(pretrain_data, show_progress=(rank == 0))
 
+    torch.cuda.empty_cache()
     dist.destroy_process_group()
 
     return config['model'], config['dataset']

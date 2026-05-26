@@ -14,7 +14,7 @@ eval_batch_size: 1024
 train_batch_size: 512
 stopping_step: 10
 
-gpu_id: '0'
+gpu_id: '1'
 log_prefix: ''
 log_suffix: ''
 

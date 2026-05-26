@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +11,6 @@ class MISSRec(Transformer):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
-        self.best_item_embedding_path = os.path.join(config['data_path'], 'item_embedding.npy')
         self._init_interest_graph_fusion()
 
         self.train_stage = config['train_stage']
@@ -33,8 +31,6 @@ class MISSRec(Transformer):
 
         if self.train_stage in ['pretrain', 'inductive_ft']:
             self.item_embedding = None
-        else:
-            self._init_item_embedding_from_npy()
         # for `transductive_ft`, `item_embedding` is defined in SASRec base model
         if self.train_stage in ['inductive_ft', 'transductive_ft']:
             # NOTE: `plm_embedding` in pre-train stage will be carried via dataloader
@@ -67,37 +63,10 @@ class MISSRec(Transformer):
         if 'img' in self.modal_type:
             self.img_adaptor = nn.Linear(config['img_size'], config['hidden_size'])
 
-    def _get_best_item_embedding_path(self):
-        return self.best_item_embedding_path
-
-    def _init_item_embedding_from_npy(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path) or self.item_embedding is None:
-                return
-
-            lightgcn_emb = np.load(emb_path)
-            copy_dim = min(lightgcn_emb.shape[1], self.item_embedding.weight.size(1))
-            lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()[:, :copy_dim]
-            with torch.no_grad():
-                if lightgcn_emb.shape[0] == self.n_items:
-                    self.item_embedding.weight.data[:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy.")
-                elif lightgcn_emb.shape[0] == self.n_items - 1:
-                    self.item_embedding.weight.data[1:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy (with padding offset).")
-                else:
-                    print(f"LightGCN nodes ({lightgcn_emb.shape[0]}) != n_items ({self.n_items})")
-        except Exception as e:
-            print("Failed to load or apply LightGCN embeddings:", e)
-
     def _init_interest_graph_fusion(self):
-        emb_path = self._get_best_item_embedding_path()
+        emb_path = '/mnt/data/zyj/MM23-MISSRec/dataset/downstream/Scientific_mm_full/best_item_embedding.npy'
         try:
+            import os
             import numpy as np
 
             if not os.path.exists(emb_path):
@@ -145,23 +114,12 @@ class MISSRec(Transformer):
         attn_weight = F.softmax(attn_score, dim=-1)
         attn_weight = torch.nan_to_num(attn_weight, nan=0.0)
 
-        graph_confidence = (attn_weight.max(dim=-1, keepdim=True)[0])
-
         graph_interest = torch.matmul(attn_weight, graph_emb)
         graph_interest = F.normalize(graph_interest, dim=-1)
 
-        valid_item_count = (item_seq != 0).sum(-1).clamp(min=2).float()
-        max_entropy = valid_item_count.log().view(-1, 1, 1)
-        attn_entropy = -(attn_weight * torch.log(attn_weight.clamp_min(1e-12))).sum(-1, keepdim=True)
-        interest_uncertainty = (attn_entropy / max_entropy).clamp(0.0, 1.0)
-
-        adaptive_weight = interest_uncertainty * graph_confidence
-
         gate = torch.sigmoid(self.interest_graph_gate(torch.cat([interest_emb, graph_interest], dim=-1)))
         scale = torch.sigmoid(self.interest_graph_scale)
-        #fused_interest_emb = interest_emb + scale * interest_uncertainty * gate * graph_interest
-
-        fused_interest_emb =interest_emb+ scale* adaptive_weight* gate* graph_interest
+        fused_interest_emb = interest_emb + scale * gate * graph_interest
 
         if interest_seq is not None:
             fused_interest_emb = fused_interest_emb * (interest_seq != 0).unsqueeze(-1).float()

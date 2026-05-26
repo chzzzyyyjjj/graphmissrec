@@ -28,6 +28,17 @@ class MISSRecTrainer(Trainer):
             multiple parts and the model return these multiple parts loss instead of the sum of loss, it will return a
             tuple which includes the sum of loss in each part.
         """
+        self.model.cur_epoch = epoch_idx
+        
+        # --- 渐进解冻逻辑 ---
+        if hasattr(self.model, 'freeze_graph_dims'):
+            # 前 5 个 Epoch 冻结图特征的前 64 维，后续开始解冻
+            if epoch_idx >= 5:
+                if getattr(self.model, 'freeze_graph_dims', False):
+                    self.logger.info(f"\n[Epoch {epoch_idx}] Graph features (first 64 dims) unfreezed for fine-tuning!")
+                    self.model.freeze_graph_dims = False
+        # ------------------
+        
         self._multimodal_interest_discovery(epoch_idx)
         self.model.train()
         loss_func = loss_func or self.model.calculate_loss
@@ -299,6 +310,17 @@ class DDPTrainer(Trainer):
             multiple parts and the model return these multiple parts loss instead of the sum of loss, it will return a
             tuple which includes the sum of loss in each part.
         """
+        
+        # --- 渐进解冻逻辑 ---
+        self.logger.info(f"Debug: Entering _train_epoch with epoch_idx={epoch_idx}, hasattr={hasattr(self.model, 'freeze_graph_dims')}")
+        if hasattr(self.model, 'freeze_graph_dims'):
+            # 前 5 个 Epoch 冻结图特征的前 64 维，后续开始解冻
+            if epoch_idx >= 5:
+                if getattr(self.model, 'freeze_graph_dims', False):
+                    self.logger.info(f"\n[Epoch {epoch_idx}] Graph features (first 64 dims) unfreezed for fine-tuning!")
+                    self.model.freeze_graph_dims = False
+        # ------------------
+        
         self.model.train()
         loss_func = loss_func or self.model.calculate_loss
         total_loss = None
@@ -446,6 +468,7 @@ class DDPTrainer(Trainer):
         valid_step = 0
 
         for epoch_idx in range(self.start_epoch, self.epochs):
+            print(f"Starting Epoch {epoch_idx}/{self.epochs}")
             # train
             training_start_time = time()
             train_loss = self._train_epoch(train_data, epoch_idx, show_progress=show_progress)
@@ -676,6 +699,7 @@ class DDPMISSRecPretrainTrainer(DDPPretrainTrainer):
         if self.rank == 0:
             all_embedding_list = []
             self.model.eval()
+            preproc_bs = 256
             # get modality embeddings
             if 'text' in self.model.modal_type:
                 all_text_embeddings = []
@@ -686,6 +710,7 @@ class DDPMISSRecPretrainTrainer(DDPPretrainTrainer):
                     del batch_data
                     all_text_embeddings.append(text_embeddings.to(plm_embedding_data.device))
                     del text_embeddings
+                    torch.cuda.empty_cache()
                 all_text_embeddings = torch.cat(all_text_embeddings, dim=0)
                 all_embedding_list.append(all_text_embeddings)
             if 'img' in self.model.modal_type:
@@ -697,15 +722,18 @@ class DDPMISSRecPretrainTrainer(DDPPretrainTrainer):
                     del batch_data
                     all_img_embeddings.append(img_embeddings.to(img_embedding_data.device))
                     del img_embeddings
+                    torch.cuda.empty_cache()
                 all_img_embeddings = torch.cat(all_img_embeddings, dim=0)
                 all_embedding_list.append(all_img_embeddings)
             all_embedding = torch.cat(all_embedding_list, dim=0)
             
             # multi-modal interest discovery
             # cluster_idx, centroids = cluster_dpc_knn(
+            cluster_batch_size = 1024
             cluster_idx, centroids = cluster_kmeans(
                 all_embedding, 
                 cluster_num=dataloader.dataset.num_interest, 
+                batch_size=cluster_batch_size,
                 # local_size=dataloader.dataset.knn_local_size
             )
             cluster_idx += 1 # offset 1 for padding_idx
@@ -714,6 +742,7 @@ class DDPMISSRecPretrainTrainer(DDPPretrainTrainer):
             centroids = centroids.contiguous()
             kmeans_device = cluster_idx.device
             del all_embedding_list, all_embedding
+            torch.cuda.empty_cache()
         else: # rank != 0
             cluster_idx_num = text_embedding_num + img_embedding_num
             cluster_idx = torch.zeros(cluster_idx_num, dtype=torch.long, device=dataloader.dataset.interest_embeddings.device)
@@ -741,4 +770,5 @@ class DDPMISSRecPretrainTrainer(DDPPretrainTrainer):
             read_ptr += img_embedding_num
         assert read_ptr == len(cluster_idx), f"read_ptr={read_ptr}, len(cluster_idx)={len(cluster_idx)}"
         del cluster_idx, centroids
+        torch.cuda.empty_cache()
         self.logger.info(f'Finish multi-modal interest discovery' + ('' if epoch_idx is None else f' before {epoch_idx}-th epoch'))

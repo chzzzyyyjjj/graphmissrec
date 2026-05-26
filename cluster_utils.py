@@ -110,7 +110,7 @@ if __name__ == '__main__':
     cluster_num = int(N * 0.1)
     batch_size = 2048
     niter = 3
-    all_tokens = torch.rand(N, D, device='cuda:0')
+    all_tokens = torch.rand(N, D, device='cuda:1')
     cluster_idx, centroids = cluster_kmeans(all_tokens, cluster_num, batch_size, niter)
     print(cluster_idx.shape, centroids.shape)
     input("wait")

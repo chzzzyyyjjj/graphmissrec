@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,8 +11,26 @@ class MISSRec(Transformer):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
-        self.best_item_embedding_path = os.path.join(config['data_path'], 'item_embedding.npy')
-        self._init_interest_graph_fusion()
+        # Pre-computed graph embeddings are used only as Graph Alignment targets.
+        try:
+            import numpy as np
+            import os
+            emb_path = '/mnt/data/zyj/MM23-MISSRec/dataset/downstream/Scientific_mm_full/best_item_embedding.npy'
+            if os.path.exists(emb_path):
+                lightgcn_emb = np.load(emb_path)
+                if lightgcn_emb.shape[0] == self.n_items:
+                    lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()
+                elif lightgcn_emb.shape[0] == self.n_items - 1:
+                    lightgcn_tensor = torch.from_numpy(
+                        np.concatenate([np.zeros((1, lightgcn_emb.shape[1])), lightgcn_emb], axis=0)
+                    ).float()
+                else:
+                    lightgcn_tensor = torch.zeros(self.n_items, self.hidden_size)
+                if lightgcn_tensor.shape[1] != self.hidden_size:
+                    self.lightgcn_proj = nn.Linear(lightgcn_tensor.shape[1], self.hidden_size)
+                self.register_buffer('lightgcn_graph_emb', lightgcn_tensor)
+        except Exception as e:
+            print("Failed to load LightGCN embeddings:", e)
 
         self.train_stage = config['train_stage']
         self.temperature = config['temperature']
@@ -33,9 +50,8 @@ class MISSRec(Transformer):
 
         if self.train_stage in ['pretrain', 'inductive_ft']:
             self.item_embedding = None
-        else:
-            self._init_item_embedding_from_npy()
         # for `transductive_ft`, `item_embedding` is defined in SASRec base model
+
         if self.train_stage in ['inductive_ft', 'transductive_ft']:
             # NOTE: `plm_embedding` in pre-train stage will be carried via dataloader
             all_num_embeddings = 0
@@ -67,106 +83,6 @@ class MISSRec(Transformer):
         if 'img' in self.modal_type:
             self.img_adaptor = nn.Linear(config['img_size'], config['hidden_size'])
 
-    def _get_best_item_embedding_path(self):
-        return self.best_item_embedding_path
-
-    def _init_item_embedding_from_npy(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path) or self.item_embedding is None:
-                return
-
-            lightgcn_emb = np.load(emb_path)
-            copy_dim = min(lightgcn_emb.shape[1], self.item_embedding.weight.size(1))
-            lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()[:, :copy_dim]
-            with torch.no_grad():
-                if lightgcn_emb.shape[0] == self.n_items:
-                    self.item_embedding.weight.data[:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy.")
-                elif lightgcn_emb.shape[0] == self.n_items - 1:
-                    self.item_embedding.weight.data[1:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy (with padding offset).")
-                else:
-                    print(f"LightGCN nodes ({lightgcn_emb.shape[0]}) != n_items ({self.n_items})")
-        except Exception as e:
-            print("Failed to load or apply LightGCN embeddings:", e)
-
-    def _init_interest_graph_fusion(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path):
-                return
-
-            graph_emb = np.load(emb_path)
-            if graph_emb.shape[0] == self.n_items:
-                graph_tensor = torch.from_numpy(graph_emb).float()
-            elif graph_emb.shape[0] == self.n_items - 1:
-                pad_emb = np.zeros((1, graph_emb.shape[1]), dtype=graph_emb.dtype)
-                graph_tensor = torch.from_numpy(np.concatenate([pad_emb, graph_emb], axis=0)).float()
-            else:
-                print(f"Graph embedding nodes ({graph_emb.shape[0]}) != n_items ({self.n_items}); skip Interest-level Graph Fusion.")
-                return
-
-            self.register_buffer('interest_graph_item_emb', graph_tensor)
-            if graph_tensor.shape[1] != self.hidden_size:
-                self.interest_graph_adapter = nn.Linear(graph_tensor.shape[1], self.hidden_size)
-                self._init_weights(self.interest_graph_adapter)
-
-            self.interest_graph_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
-            self._init_weights(self.interest_graph_gate)
-            self.interest_graph_scale = nn.Parameter(torch.tensor(-2.0, dtype=torch.float))
-        except Exception as e:
-            print("Failed to load graph embeddings for Interest-level Graph Fusion:", e)
-
-    def _get_interest_graph_item_emb(self, item_seq):
-        if not hasattr(self, 'interest_graph_item_emb'):
-            return None
-
-        graph_emb = self.interest_graph_item_emb[item_seq]
-        if hasattr(self, 'interest_graph_adapter'):
-            graph_emb = self.interest_graph_adapter(graph_emb)
-        graph_emb = F.normalize(graph_emb, dim=-1)
-        return graph_emb * (item_seq != 0).unsqueeze(-1).float()
-
-    def _fuse_interest_graph(self, item_seq, interest_seq, interest_emb):
-        graph_emb = self._get_interest_graph_item_emb(item_seq)
-        if graph_emb is None or interest_emb is None:
-            return interest_emb
-
-        item_padding_mask = (item_seq == 0).unsqueeze(1)
-        attn_score = torch.matmul(interest_emb, graph_emb.transpose(1, 2))
-        attn_score = attn_score.masked_fill(item_padding_mask, float('-inf'))
-        attn_weight = F.softmax(attn_score, dim=-1)
-        attn_weight = torch.nan_to_num(attn_weight, nan=0.0)
-
-        graph_confidence = (attn_weight.max(dim=-1, keepdim=True)[0])
-
-        graph_interest = torch.matmul(attn_weight, graph_emb)
-        graph_interest = F.normalize(graph_interest, dim=-1)
-
-        valid_item_count = (item_seq != 0).sum(-1).clamp(min=2).float()
-        max_entropy = valid_item_count.log().view(-1, 1, 1)
-        attn_entropy = -(attn_weight * torch.log(attn_weight.clamp_min(1e-12))).sum(-1, keepdim=True)
-        interest_uncertainty = (attn_entropy / max_entropy).clamp(0.0, 1.0)
-
-        adaptive_weight = interest_uncertainty * graph_confidence
-
-        gate = torch.sigmoid(self.interest_graph_gate(torch.cat([interest_emb, graph_interest], dim=-1)))
-        scale = torch.sigmoid(self.interest_graph_scale)
-        #fused_interest_emb = interest_emb + scale * interest_uncertainty * gate * graph_interest
-
-        fused_interest_emb =interest_emb+ scale* adaptive_weight* gate* graph_interest
-
-        if interest_seq is not None:
-            fused_interest_emb = fused_interest_emb * (interest_seq != 0).unsqueeze(-1).float()
-        return fused_interest_emb
-
     def get_encoder_attention_mask(self, dec_input_seq=None, is_casual=True):
         """memory_mask: [BxL], dec_input_seq: [BxNq]"""
         key_padding_mask = (dec_input_seq == 0) # binary, [BxNq], Nq=L
@@ -196,9 +112,29 @@ class MISSRec(Transformer):
         return attn_mask, cross_attn_mask, key_padding_mask
 
     # def forward(self, enc_item_seq, item_emb, item_modal_empty_mask, item_seq_len, dec_input_seq=None, dec_input_emb=None, dec_inp_seq_len=None):
-    def forward(self, item_seq, item_emb, item_modal_empty_mask, item_seq_len, interest_seq=None, interest_emb=None, interest_seq_len=None):
+    def forward(self, item_seq, item_emb, item_modal_empty_mask, item_seq_len, interest_seq=None, interest_emb=None, interest_seq_len=None, compute_align_loss=True):
+        align_loss = item_emb.new_zeros(())
+
+        # Graph Alignment only: graph embeddings supervise interest tokens via
+        # an auxiliary contrastive loss and are not injected into the model path.
+        if compute_align_loss and interest_emb is not None and hasattr(self, 'lightgcn_graph_emb') and getattr(self, 'lightgcn_graph_emb', None) is not None:
+            graph_emb_seq = self.lightgcn_graph_emb[item_seq]
+            if hasattr(self, 'lightgcn_proj'):
+                graph_emb_seq = self.lightgcn_proj(graph_emb_seq)
+            graph_emb_seq = F.normalize(graph_emb_seq, dim=-1)
+
+            attn_score = torch.matmul(interest_emb, graph_emb_seq.transpose(1, 2))
+            attn_weight = F.softmax(attn_score, dim=-1)
+            graph_interest = torch.matmul(attn_weight, graph_emb_seq)
+            graph_interest = F.normalize(graph_interest, dim=-1)
+
+            norm_interest_emb = F.normalize(interest_emb, dim=-1)
+            align_logits = torch.matmul(graph_interest, norm_interest_emb.transpose(1, 2)) / self.temperature
+            B_align, N_align, _ = graph_interest.shape
+            align_labels = torch.arange(N_align, device=graph_interest.device).unsqueeze(0).expand(B_align, N_align)
+            align_loss = F.cross_entropy(align_logits.view(B_align * N_align, N_align), align_labels.flatten())
+
         # encoder input
-        interest_emb = self._fuse_interest_graph(item_seq, interest_seq, interest_emb)
         enc_input_emb = interest_emb
         src_attn_mask, src_key_padding_mask = self.get_encoder_attention_mask(interest_seq, is_casual=False)
 
@@ -235,7 +171,7 @@ class MISSRec(Transformer):
         )
 
         output = self.gather_indexes(trm_output, item_seq_len - 1)
-        return output, interest_orthogonal_regularization.mean()  # [BxD], []
+        return output, interest_orthogonal_regularization.mean(), align_loss  # [BxD], [], []
 
     def seq_item_contrastive_task(self, seq_output, interaction, batch_labels):
         if 'text' in self.modal_type:
@@ -249,13 +185,13 @@ class MISSRec(Transformer):
                 pos_item_emb = pos_text_emb
             if 'img' in self.modal_type:
                 pos_item_emb = pos_img_emb
-            pos_item_emb = F.normalize(pos_item_emb, dim=1)
+            pos_items_emb = F.normalize(pos_items_emb, dim=1)
             logits = torch.matmul(seq_output, pos_item_emb.transpose(0, 1)) / self.temperature
         loss = F.cross_entropy(logits, batch_labels)
         return loss
 
     def seq_seq_contrastive_task(self, seq_output, interaction, img_emb, batch_labels):
-        seq_output_aug, interest_orthogonal_regularization_aug = self._compute_seq_embeddings_pretrain(
+        seq_output_aug, interest_orthogonal_regularization_aug, align_loss_aug = self._compute_seq_embeddings_pretrain(
             item_seq=interaction[self.ITEM_SEQ + '_aug'], 
             item_seq_len=interaction[self.ITEM_SEQ_LEN + '_aug'], 
             text_emb=self.text_adaptor(interaction['text_emb_list_aug']),
@@ -270,11 +206,11 @@ class MISSRec(Transformer):
         )
         logits = torch.matmul(seq_output, seq_output_aug.transpose(0, 1)) / self.temperature
         loss = F.cross_entropy(logits, batch_labels)
-        return loss, interest_orthogonal_regularization_aug
+        return loss, interest_orthogonal_regularization_aug, align_loss_aug
 
     def pretrain(self, interaction):
         img_emb=self.img_adaptor(interaction['img_emb_list'])
-        seq_output, interest_orthogonal_regularization = self._compute_seq_embeddings_pretrain(
+        seq_output, interest_orthogonal_regularization, align_loss = self._compute_seq_embeddings_pretrain(
             item_seq=interaction[self.ITEM_SEQ], 
             item_seq_len=interaction[self.ITEM_SEQ_LEN], 
             text_emb=self.text_adaptor(interaction['text_emb_list']),
@@ -292,9 +228,10 @@ class MISSRec(Transformer):
         batch_labels = torch.arange(batch_size, device=device, dtype=torch.long)
         
         loss_seq_item = self.seq_item_contrastive_task(seq_output, interaction, batch_labels)
-        loss_seq_seq, interest_orthogonal_regularization_aug = self.seq_seq_contrastive_task(
+        loss_seq_seq, interest_orthogonal_regularization_aug, align_loss_aug = self.seq_seq_contrastive_task(
             seq_output, interaction, img_emb, batch_labels)
-        loss = loss_seq_item + self.lam * loss_seq_seq + self.gamma * (interest_orthogonal_regularization + interest_orthogonal_regularization_aug)
+        align_loss_weight = getattr(self, 'align_loss_weight', 0.1)
+        loss = loss_seq_item + self.lam * loss_seq_seq + self.gamma * (interest_orthogonal_regularization + interest_orthogonal_regularization_aug) + align_loss_weight * (align_loss + align_loss_aug)
         return loss
 
     def _compute_seq_embeddings_pretrain(
@@ -306,7 +243,8 @@ class MISSRec(Transformer):
             # img_interest_seq=None
             unique_interest_seq=None, 
             unique_interest_emb_list=None, 
-            unique_interest_len=None
+            unique_interest_len=None,
+            compute_align_loss=True
         ):
 
         item_emb_list = 0 if self.seq_mm_fusion == 'add' else []
@@ -330,19 +268,20 @@ class MISSRec(Transformer):
             item_emb_list = torch.stack(item_emb_list, dim=1) # [BxMxLxD]
         item_modal_empty_mask = torch.stack(item_modal_empty_mask_list, dim=1) # [BxMxL]
 
-        seq_output, interest_orthogonal_regularization = self.forward(
+        seq_output, interest_orthogonal_regularization, align_loss = self.forward(
             item_seq=item_seq, 
             item_emb=item_emb_list, 
             item_modal_empty_mask=item_modal_empty_mask, 
             item_seq_len=item_seq_len, 
             interest_seq=unique_interest_seq, 
             interest_emb=unique_interest_emb_list, 
-            interest_seq_len=unique_interest_len
+            interest_seq_len=unique_interest_len,
+            compute_align_loss=compute_align_loss
         )
         seq_output = F.normalize(seq_output, dim=1)
-        return seq_output, interest_orthogonal_regularization
+        return seq_output, interest_orthogonal_regularization, align_loss
 
-    def _compute_seq_embeddings(self, item_seq, item_seq_len):
+    def _compute_seq_embeddings(self, item_seq, item_seq_len, compute_align_loss=True):
         if 'text' in self.modal_type:
             text_emb = self.text_adaptor(self.plm_embedding(item_seq))
             text_emb_empty_mask = self.plm_embedding_empty_mask[item_seq]
@@ -387,17 +326,18 @@ class MISSRec(Transformer):
         unique_interest_len = torch.tensor(unique_interest_len, device=unique_interest_seq.device)
         del interest_seq_list
 
-        seq_output, interest_orthogonal_regularization = self.forward(
+        seq_output, interest_orthogonal_regularization, align_loss = self.forward(
             item_seq=item_seq, 
             item_emb=item_emb_list, 
             item_modal_empty_mask=item_modal_empty_mask, 
             item_seq_len=item_seq_len, 
             interest_seq=unique_interest_seq, 
             interest_emb=unique_interest_emb_list, 
-            interest_seq_len=unique_interest_len
+            interest_seq_len=unique_interest_len,
+            compute_align_loss=compute_align_loss
         )
         seq_output = F.normalize(seq_output, dim=1)
-        return seq_output, interest_orthogonal_regularization
+        return seq_output, interest_orthogonal_regularization, align_loss
 
     def _compute_test_item_embeddings(self):
         test_item_emb = 0
@@ -440,7 +380,8 @@ class MISSRec(Transformer):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
 
-        seq_output, interest_orthogonal_regularization = self._compute_seq_embeddings(item_seq, item_seq_len)
+        seq_output, interest_orthogonal_regularization, align_loss = self._compute_seq_embeddings(item_seq, item_seq_len)
+        
         if 'text' in self.modal_type and 'img' in self.modal_type: # weighted fusion
             test_text_emb = self.text_adaptor(self.plm_embedding.weight)
             test_img_emb = self.img_adaptor(self.img_embedding.weight)
@@ -450,14 +391,16 @@ class MISSRec(Transformer):
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1)) / self.temperature
 
         pos_items = interaction[self.POS_ITEM_ID]
-        loss = self.loss_fct(logits, pos_items) + self.gamma * interest_orthogonal_regularization
+        align_loss_weight = getattr(self, 'align_loss_weight', 0.1)
+        loss = self.loss_fct(logits, pos_items) + self.gamma * interest_orthogonal_regularization + align_loss_weight * align_loss
         return loss
 
     def full_sort_predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
 
-        seq_output, _ = self._compute_seq_embeddings(item_seq, item_seq_len)
+        seq_output, _, _ = self._compute_seq_embeddings(item_seq, item_seq_len, compute_align_loss=False)
+        
         if 'text' in self.modal_type and 'img' in self.modal_type: # weighted fusion
             test_text_emb = self.text_adaptor(self.plm_embedding.weight)
             test_img_emb = self.img_adaptor(self.img_embedding.weight)

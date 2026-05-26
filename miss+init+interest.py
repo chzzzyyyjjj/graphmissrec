@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,8 +11,9 @@ class MISSRec(Transformer):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
-        self.best_item_embedding_path = os.path.join(config['data_path'], 'item_embedding.npy')
-        self._init_interest_graph_fusion()
+        self.graph_emb_path = '/mnt/data/zyj/MM23-MISSRec/dataset/downstream/Scientific_mm_full/best_item_embedding.npy'
+        self._init_graph_item_embedding()
+        self._init_interest_graph_fusion(config['hidden_size'])
 
         self.train_stage = config['train_stage']
         self.temperature = config['temperature']
@@ -33,8 +33,6 @@ class MISSRec(Transformer):
 
         if self.train_stage in ['pretrain', 'inductive_ft']:
             self.item_embedding = None
-        else:
-            self._init_item_embedding_from_npy()
         # for `transductive_ft`, `item_embedding` is defined in SASRec base model
         if self.train_stage in ['inductive_ft', 'transductive_ft']:
             # NOTE: `plm_embedding` in pre-train stage will be carried via dataloader
@@ -67,62 +65,55 @@ class MISSRec(Transformer):
         if 'img' in self.modal_type:
             self.img_adaptor = nn.Linear(config['img_size'], config['hidden_size'])
 
-    def _get_best_item_embedding_path(self):
-        return self.best_item_embedding_path
-
-    def _init_item_embedding_from_npy(self):
-        emb_path = self._get_best_item_embedding_path()
+    def _load_padded_graph_embedding(self):
         try:
+            import os
             import numpy as np
 
-            if not os.path.exists(emb_path) or self.item_embedding is None:
-                return
+            if not os.path.exists(self.graph_emb_path):
+                return None
 
-            lightgcn_emb = np.load(emb_path)
-            copy_dim = min(lightgcn_emb.shape[1], self.item_embedding.weight.size(1))
-            lightgcn_tensor = torch.from_numpy(lightgcn_emb).float()[:, :copy_dim]
-            with torch.no_grad():
-                if lightgcn_emb.shape[0] == self.n_items:
-                    self.item_embedding.weight.data[:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy.")
-                elif lightgcn_emb.shape[0] == self.n_items - 1:
-                    self.item_embedding.weight.data[1:, :copy_dim] = lightgcn_tensor
-                    self.item_embedding.weight.data[0].zero_()
-                    print("Successfully init item_embedding with LightGCN npy (with padding offset).")
-                else:
-                    print(f"LightGCN nodes ({lightgcn_emb.shape[0]}) != n_items ({self.n_items})")
-        except Exception as e:
-            print("Failed to load or apply LightGCN embeddings:", e)
-
-    def _init_interest_graph_fusion(self):
-        emb_path = self._get_best_item_embedding_path()
-        try:
-            import numpy as np
-
-            if not os.path.exists(emb_path):
-                return
-
-            graph_emb = np.load(emb_path)
+            graph_emb = np.load(self.graph_emb_path)
             if graph_emb.shape[0] == self.n_items:
-                graph_tensor = torch.from_numpy(graph_emb).float()
-            elif graph_emb.shape[0] == self.n_items - 1:
+                return torch.from_numpy(graph_emb).float()
+            if graph_emb.shape[0] == self.n_items - 1:
                 pad_emb = np.zeros((1, graph_emb.shape[1]), dtype=graph_emb.dtype)
-                graph_tensor = torch.from_numpy(np.concatenate([pad_emb, graph_emb], axis=0)).float()
-            else:
-                print(f"Graph embedding nodes ({graph_emb.shape[0]}) != n_items ({self.n_items}); skip Interest-level Graph Fusion.")
-                return
+                return torch.from_numpy(np.concatenate([pad_emb, graph_emb], axis=0)).float()
 
-            self.register_buffer('interest_graph_item_emb', graph_tensor)
-            if graph_tensor.shape[1] != self.hidden_size:
-                self.interest_graph_adapter = nn.Linear(graph_tensor.shape[1], self.hidden_size)
-                self._init_weights(self.interest_graph_adapter)
-
-            self.interest_graph_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
-            self._init_weights(self.interest_graph_gate)
-            self.interest_graph_scale = nn.Parameter(torch.tensor(-2.0, dtype=torch.float))
+            print(f"Graph embedding nodes ({graph_emb.shape[0]}) != n_items ({self.n_items}); skip graph embedding.")
+            return None
         except Exception as e:
-            print("Failed to load graph embeddings for Interest-level Graph Fusion:", e)
+            print("Failed to load graph embeddings:", e)
+            return None
+
+    def _init_graph_item_embedding(self):
+        item_embedding = getattr(self, 'item_embedding', None)
+        if item_embedding is None:
+            return
+
+        graph_tensor = self._load_padded_graph_embedding()
+        if graph_tensor is None:
+            return
+
+        with torch.no_grad():
+            copy_dim = min(graph_tensor.shape[1], item_embedding.weight.data.shape[1])
+            item_embedding.weight.data[:, :copy_dim] = graph_tensor[:, :copy_dim]
+            item_embedding.weight.data[0].zero_()
+        print(f"Successfully init item_embedding with graph npy (copy_dim={copy_dim}).")
+
+    def _init_interest_graph_fusion(self, hidden_size):
+        graph_tensor = self._load_padded_graph_embedding()
+        if graph_tensor is None:
+            return
+
+        self.register_buffer('interest_graph_item_emb', graph_tensor)
+        if graph_tensor.shape[1] != hidden_size:
+            self.interest_graph_adapter = nn.Linear(graph_tensor.shape[1], hidden_size)
+            self._init_weights(self.interest_graph_adapter)
+
+        self.interest_graph_gate = nn.Linear(hidden_size * 2, hidden_size)
+        self._init_weights(self.interest_graph_gate)
+        self.interest_graph_scale = nn.Parameter(torch.tensor(-2.0, dtype=torch.float))
 
     def _get_interest_graph_item_emb(self, item_seq):
         if not hasattr(self, 'interest_graph_item_emb'):
@@ -145,23 +136,12 @@ class MISSRec(Transformer):
         attn_weight = F.softmax(attn_score, dim=-1)
         attn_weight = torch.nan_to_num(attn_weight, nan=0.0)
 
-        graph_confidence = (attn_weight.max(dim=-1, keepdim=True)[0])
-
         graph_interest = torch.matmul(attn_weight, graph_emb)
         graph_interest = F.normalize(graph_interest, dim=-1)
 
-        valid_item_count = (item_seq != 0).sum(-1).clamp(min=2).float()
-        max_entropy = valid_item_count.log().view(-1, 1, 1)
-        attn_entropy = -(attn_weight * torch.log(attn_weight.clamp_min(1e-12))).sum(-1, keepdim=True)
-        interest_uncertainty = (attn_entropy / max_entropy).clamp(0.0, 1.0)
-
-        adaptive_weight = interest_uncertainty * graph_confidence
-
         gate = torch.sigmoid(self.interest_graph_gate(torch.cat([interest_emb, graph_interest], dim=-1)))
         scale = torch.sigmoid(self.interest_graph_scale)
-        #fused_interest_emb = interest_emb + scale * interest_uncertainty * gate * graph_interest
-
-        fused_interest_emb =interest_emb+ scale* adaptive_weight* gate* graph_interest
+        fused_interest_emb = interest_emb + scale * gate * graph_interest
 
         if interest_seq is not None:
             fused_interest_emb = fused_interest_emb * (interest_seq != 0).unsqueeze(-1).float()

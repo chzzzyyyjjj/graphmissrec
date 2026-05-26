@@ -4,7 +4,7 @@ import torch
 from recbole.config import Config
 from recbole.data import data_preparation
 from recbole.utils import init_seed, init_logger, set_color
-
+import os
 from missrec import MISSRec
 from data.dataset import MISSRecDataset
 from collections import OrderedDict
@@ -106,6 +106,10 @@ def finetune(dataset, pretrained_file, props='props/MISSRec.yaml,props/finetune.
 
 
 if __name__ == '__main__':
+    print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("torch.cuda.device_count() =", torch.cuda.device_count())
+    print("current_device =", torch.cuda.current_device())
+    print("device_name =", torch.cuda.get_device_name(torch.cuda.current_device()))
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', type=str, default='Scientific_mm_full', help='dataset name')
     parser.add_argument('-p', type=str, default='', help='pre-trained model path')
