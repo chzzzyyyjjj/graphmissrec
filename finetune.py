@@ -11,6 +11,16 @@ from collections import OrderedDict
 from trainer import MISSRecTrainer
 
 
+def parse_config_overrides(unparsed_args):
+    overrides = {}
+    for arg in unparsed_args:
+        if not arg.startswith('--') or '=' not in arg:
+            continue
+        key, value = arg[2:].split('=', 1)
+        overrides[key] = value
+    return overrides
+
+
 def get_logger_filename(logger):
     file_handler = next((handler for handler in logger.handlers if isinstance(handler, FileHandler)), None)
     if file_handler:
@@ -63,6 +73,8 @@ def finetune(dataset, pretrained_file, props='props/MISSRec.yaml,props/finetune.
             else:
                 new_state_dict[name] = val
         model.load_state_dict(new_state_dict, strict=False)
+        if hasattr(model, '_apply_training_modality_missing'):
+            model._apply_training_modality_missing(config)
         if fix_enc:
             logger.info(f'Fix encoder parameters.')
             for _ in model.position_embedding.parameters():
@@ -90,9 +102,11 @@ def finetune(dataset, pretrained_file, props='props/MISSRec.yaml,props/finetune.
 
     # model evaluation
     test_result = trainer.evaluate(test_data, load_best_model=True, show_progress=config['show_progress'])
+    final_modal_weight_diagnostics = trainer.log_final_modal_weight_diagnostics(test_data)
 
     logger.info(set_color('best valid ', 'yellow') + f': {best_valid_result}')
     logger.info(set_color('test result', 'yellow') + f': {test_result}')
+    logger.info(set_color('final modal weight diagnostics', 'yellow') + f': {final_modal_weight_diagnostics}')
 
     logger_Filename = get_logger_filename(logger)
     logger.info(f"Write log to {logger_Filename}")
@@ -101,7 +115,8 @@ def finetune(dataset, pretrained_file, props='props/MISSRec.yaml,props/finetune.
         'best_valid_score': best_valid_score,
         'valid_score_bigger': config['valid_metric_bigger'],
         'best_valid_result': best_valid_result,
-        'test_result': test_result
+        'test_result': test_result,
+        'final_modal_weight_diagnostics': final_modal_weight_diagnostics
     }
 
 
@@ -119,5 +134,14 @@ if __name__ == '__main__':
     parser.add_argument('-note', type=str, default='')
     args, unparsed = parser.parse_known_args()
     print(args)
+    overrides = parse_config_overrides(unparsed)
 
-    finetune(args.d, props=args.props, mode=args.mode, pretrained_file=args.p, fix_enc=args.f, log_prefix=args.note)
+    finetune(
+        args.d,
+        props=args.props,
+        mode=args.mode,
+        pretrained_file=args.p,
+        fix_enc=args.f,
+        log_prefix=args.note,
+        **overrides
+    )

@@ -1,5 +1,7 @@
 import os
 import math
+import csv
+import json
 from time import time
 from tqdm import tqdm
 import torch
@@ -13,6 +15,108 @@ from cluster_utils import cluster_dpc_knn, cluster_kmeans
 
 
 class MISSRecTrainer(Trainer):
+    def _config_bool(self, key, default=False):
+        if key not in self.config:
+            return default
+        value = self.config[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ['true', '1', 'yes', 'y']
+        return bool(value)
+
+    def modal_weight_visualization_enabled(self):
+        return self._config_bool('modal_weight_vis', True)
+
+    def _modal_weight_output_dir(self):
+        if 'modal_weight_vis_dir' in self.config and self.config['modal_weight_vis_dir']:
+            return str(self.config['modal_weight_vis_dir'])
+        note = self.config['log_prefix'] if 'log_prefix' in self.config else ''
+        suffix = f"_{note}" if note else ''
+        return os.path.join('picture', 'modal_weight_training', f"{self.config['dataset']}{suffix}")
+
+    def _modal_weight_config_int(self, key, default):
+        if key not in self.config:
+            return default
+        return int(self.config[key])
+
+    @torch.no_grad()
+    def _collect_modal_weight_diagnostics(self, data_loader):
+        self.model.eval()
+        max_batches = self._modal_weight_config_int('modal_weight_vis_batches', 5)
+        topk = self._modal_weight_config_int('modal_weight_vis_topk', 20)
+        merged = {}
+        count = 0
+
+        for batch_idx, batched_data in enumerate(data_loader):
+            if batch_idx >= max_batches:
+                break
+            interaction = batched_data[0] if isinstance(batched_data, tuple) else batched_data
+            interaction = interaction.to(self.device)
+            item_seq = interaction[self.model.ITEM_SEQ]
+            item_seq_len = interaction[self.model.ITEM_SEQ_LEN]
+
+            seq_output, _ = self.model._compute_seq_embeddings(item_seq, item_seq_len)
+            diag = {}
+            if hasattr(self.model, 'compute_fusion_diagnostics'):
+                diag.update(self.model.compute_fusion_diagnostics(item_seq, item_seq_len))
+
+            if (
+                hasattr(self.model, 'compute_item_fusion_weight_diagnostics')
+                and 'text' in self.model.modal_type
+                and 'img' in self.model.modal_type
+            ):
+                text_emb = self.model.text_adaptor(self.model.plm_embedding.weight)
+                img_emb = self.model.img_adaptor(self.model.img_embedding.weight)
+                diag.update(
+                    self.model.compute_item_fusion_weight_diagnostics(
+                        seq_output, text_emb, img_emb, topk=topk
+                    )
+                )
+
+            for key, value in diag.items():
+                merged[key] = merged.get(key, 0.0) + float(value)
+            count += 1
+
+        if count == 0:
+            return {}
+        return {key: value / count for key, value in merged.items()}
+
+    def collect_modal_weight_diagnostics(self, data_loader):
+        return self._collect_modal_weight_diagnostics(data_loader)
+
+    def log_final_modal_weight_diagnostics(self, data_loader):
+        if not self.modal_weight_visualization_enabled():
+            return {}
+
+        diagnostics = self._collect_modal_weight_diagnostics(data_loader)
+        if not diagnostics:
+            return {}
+
+        output_dir = self._modal_weight_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+
+        row = {
+            'dataset': self.config['dataset'],
+            'missing_mode': self.config['modality_missing_train_mode'] if 'modality_missing_train_mode' in self.config else 'none',
+            'missing_ratio': self.config['modality_missing_train_ratio'] if 'modality_missing_train_ratio' in self.config else 0.0,
+        }
+        row.update(diagnostics)
+
+        csv_path = os.path.join(output_dir, 'final_modal_weight_diagnostics.csv')
+        with open(csv_path, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=sorted(row.keys()))
+            writer.writeheader()
+            writer.writerow(row)
+
+        self.logger.info(
+            set_color('final modal weight diagnostics', 'blue')
+            + ': '
+            + json.dumps(diagnostics, sort_keys=True)
+        )
+        self.logger.info(f'Final modal weight diagnostics saved to {csv_path}')
+        return diagnostics
+
     def _train_epoch(self, train_data, epoch_idx, loss_func=None, show_progress=False):
         r"""Train the model in an epoch
 

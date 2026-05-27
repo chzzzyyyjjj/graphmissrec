@@ -1,0 +1,2 @@
+any_missing_rate,both_missing_rate,dataset,graph_adaptive_weight,graph_confidence,graph_scale,img_available_rate,img_logit_weight,img_missing_rate,interest_uncertainty,missing_mode,missing_ratio,text_available_rate,text_logit_weight,text_missing_rate
+0.21811211109161377,0.0,Pantry_mm_full,0.2005427747964859,0.4397131323814392,0.27037712931632996,0.7818879008293151,0.18090008199214935,0.21811211109161377,0.6617737889289856,img,0.1,1.0,0.8190999507904053,0.0

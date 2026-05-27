@@ -12,7 +12,7 @@ class MISSRec(Transformer):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
-        self.best_item_embedding_path = os.path.join(config['data_path'], 'item_embedding.npy')
+        self.best_item_embedding_path = os.path.join(config['data_path'], 'best_item_embedding.npy')
         self._init_interest_graph_fusion()
 
         self.train_stage = config['train_stage']
@@ -50,6 +50,8 @@ class MISSRec(Transformer):
                 all_num_embeddings += (self.img_embedding.num_embeddings - 1)
                 self.register_buffer('img_interest_lookup_table', torch.zeros(self.img_embedding.num_embeddings, dtype=torch.long))
 
+            self._apply_training_modality_missing(config)
+
             # NOTE: 只在下游微调时起效
             self.num_interest = max(math.ceil(all_num_embeddings * config["interest_ratio"]), 1)
             self.knn_local_size = max(math.ceil(all_num_embeddings * config["knn_local_ratio"]), 1)
@@ -69,6 +71,45 @@ class MISSRec(Transformer):
 
     def _get_best_item_embedding_path(self):
         return self.best_item_embedding_path
+
+    def _drop_embedding_rows_for_missing(self, embedding, empty_mask, ratio, seed):
+        if ratio <= 0:
+            return 0
+        available = (~empty_mask.data).nonzero(as_tuple=False).view(-1)
+        available = available[available != 0]
+        if available.numel() == 0:
+            return 0
+
+        drop_count = int(round(available.numel() * ratio))
+        drop_count = min(max(drop_count, 0), available.numel())
+        if drop_count == 0:
+            return 0
+
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(int(seed))
+        drop_ids = available[torch.randperm(available.numel(), generator=generator)[:drop_count]]
+        embedding.weight.data[drop_ids] = 0
+        empty_mask.data[drop_ids] = True
+        return int(drop_count)
+
+    def _apply_training_modality_missing(self, config):
+        mode = config['modality_missing_train_mode'] if 'modality_missing_train_mode' in config else 'none'
+        ratio = float(config['modality_missing_train_ratio']) if 'modality_missing_train_ratio' in config else 0.0
+        seed = int(config['modality_missing_train_seed']) if 'modality_missing_train_seed' in config else 2026
+        if mode in [None, 'none'] or ratio <= 0:
+            return
+        assert mode in ['text', 'img', 'both'], f'Unknown modality_missing_train_mode: [{mode}]'
+
+        dropped = {}
+        if mode in ['text', 'both'] and 'text' in self.modal_type:
+            dropped['text'] = self._drop_embedding_rows_for_missing(
+                self.plm_embedding, self.plm_embedding_empty_mask, ratio, seed
+            )
+        if mode in ['img', 'both'] and 'img' in self.modal_type:
+            dropped['img'] = self._drop_embedding_rows_for_missing(
+                self.img_embedding, self.img_embedding_empty_mask, ratio, seed + 9973
+            )
+        print(f"Applied training-time modality missing: mode={mode}, ratio={ratio}, dropped={dropped}")
 
     def _init_item_embedding_from_npy(self):
         emb_path = self._get_best_item_embedding_path()
@@ -166,6 +207,90 @@ class MISSRec(Transformer):
         if interest_seq is not None:
             fused_interest_emb = fused_interest_emb * (interest_seq != 0).unsqueeze(-1).float()
         return fused_interest_emb
+
+    @torch.no_grad()
+    def compute_fusion_diagnostics(self, item_seq, item_seq_len):
+        """Return modality-missing and adaptive graph-fusion statistics.
+
+        This method is for mechanism analysis only. It mirrors the graph branch
+        in `_fuse_interest_graph` without changing model outputs.
+        """
+        stats = {}
+        valid_item_mask = item_seq != 0
+        valid_item_count = valid_item_mask.sum().clamp(min=1).float()
+
+        if 'text' in self.modal_type:
+            text_missing = self.plm_embedding_empty_mask[item_seq] & valid_item_mask
+            stats['text_missing_rate'] = text_missing.float().sum() / valid_item_count
+            stats['text_available_rate'] = 1.0 - stats['text_missing_rate']
+        if 'img' in self.modal_type:
+            img_missing = self.img_embedding_empty_mask[item_seq] & valid_item_mask
+            stats['img_missing_rate'] = img_missing.float().sum() / valid_item_count
+            stats['img_available_rate'] = 1.0 - stats['img_missing_rate']
+        if 'text' in self.modal_type and 'img' in self.modal_type:
+            both_missing = (
+                self.plm_embedding_empty_mask[item_seq]
+                & self.img_embedding_empty_mask[item_seq]
+                & valid_item_mask
+            )
+            any_missing = (
+                (self.plm_embedding_empty_mask[item_seq] | self.img_embedding_empty_mask[item_seq])
+                & valid_item_mask
+            )
+            stats['both_missing_rate'] = both_missing.float().sum() / valid_item_count
+            stats['any_missing_rate'] = any_missing.float().sum() / valid_item_count
+
+        if 'text' not in self.modal_type and 'img' not in self.modal_type:
+            return {k: float(v.detach().cpu()) for k, v in stats.items()}
+
+        interest_seq_list = []
+        if 'text' in self.modal_type:
+            interest_seq_list.append(self.plm_interest_lookup_table[item_seq])
+        if 'img' in self.modal_type:
+            interest_seq_list.append(self.img_interest_lookup_table[item_seq])
+        if not interest_seq_list or not hasattr(self, 'interest_embeddings'):
+            return {k: float(v.detach().cpu()) for k, v in stats.items()}
+
+        all_interest_seq = torch.cat(interest_seq_list, dim=-1)
+        unique_interest_seq = []
+        for sample in all_interest_seq:
+            unique_interest_seq.append(sample.unique())
+        unique_interest_seq = nn.utils.rnn.pad_sequence(
+            unique_interest_seq, batch_first=True, padding_value=0
+        ).to(item_seq.device)
+        interest_emb = self.interest_embeddings[unique_interest_seq]
+
+        graph_emb = self._get_interest_graph_item_emb(item_seq)
+        if graph_emb is None or interest_emb is None:
+            return {k: float(v.detach().cpu()) for k, v in stats.items()}
+
+        item_padding_mask = (item_seq == 0).unsqueeze(1)
+        attn_score = torch.matmul(interest_emb, graph_emb.transpose(1, 2))
+        attn_score = attn_score.masked_fill(item_padding_mask, float('-inf'))
+        attn_weight = F.softmax(attn_score, dim=-1)
+        attn_weight = torch.nan_to_num(attn_weight, nan=0.0)
+
+        graph_confidence = attn_weight.max(dim=-1, keepdim=True)[0]
+        valid_item_count_per_user = (item_seq != 0).sum(-1).clamp(min=2).float()
+        max_entropy = valid_item_count_per_user.log().view(-1, 1, 1)
+        attn_entropy = -(attn_weight * torch.log(attn_weight.clamp_min(1e-12))).sum(-1, keepdim=True)
+        interest_uncertainty = (attn_entropy / max_entropy).clamp(0.0, 1.0)
+        adaptive_weight = interest_uncertainty * graph_confidence
+
+        valid_interest_mask = unique_interest_seq != 0
+        valid_interest_count = valid_interest_mask.sum().clamp(min=1).float()
+        stats['graph_confidence'] = (
+            graph_confidence.squeeze(-1) * valid_interest_mask.float()
+        ).sum() / valid_interest_count
+        stats['interest_uncertainty'] = (
+            interest_uncertainty.squeeze(-1) * valid_interest_mask.float()
+        ).sum() / valid_interest_count
+        stats['graph_adaptive_weight'] = (
+            adaptive_weight.squeeze(-1) * valid_interest_mask.float()
+        ).sum() / valid_interest_count
+        stats['graph_scale'] = torch.sigmoid(self.interest_graph_scale) if hasattr(self, 'interest_graph_scale') else torch.tensor(0.0)
+
+        return {k: float(v.detach().cpu()) for k, v in stats.items()}
 
     def get_encoder_attention_mask(self, dec_input_seq=None, is_casual=True):
         """memory_mask: [BxL], dec_input_seq: [BxNq]"""
@@ -431,6 +556,32 @@ class MISSRec(Transformer):
                 id_logits = torch.matmul(seq_output, test_id_emb.transpose(0, 1))
                 agg_logits = (id_logits + agg_logits * 2) / 3
         return agg_logits
+
+    @torch.no_grad()
+    def compute_item_fusion_weight_diagnostics(self, seq_output, text_emb, img_emb, topk=20):
+        """Summarize dynamic text/image logit weights for visualization."""
+        if 'text' not in self.modal_type or 'img' not in self.modal_type:
+            return {}
+
+        text_emb = F.normalize(text_emb, dim=1)
+        img_emb = F.normalize(img_emb, dim=1)
+        text_logits = torch.matmul(seq_output, text_emb.transpose(0, 1))
+        img_logits = torch.matmul(seq_output, img_emb.transpose(0, 1))
+        modality_logits = torch.stack([text_logits, img_logits], dim=-1)
+
+        if self.item_mm_fusion in ['dynamic_shared', 'dynamic_instance']:
+            weights = F.softmax(modality_logits * self.fusion_factor.unsqueeze(-1), dim=-1)
+        else:
+            weights = torch.full_like(modality_logits, 0.5)
+
+        k = min(topk, weights.size(1))
+        top_scores = modality_logits.max(dim=-1).values.topk(k=k, dim=1).indices
+        gather_index = top_scores.unsqueeze(-1).expand(-1, -1, 2)
+        top_weights = weights.gather(dim=1, index=gather_index)
+        return {
+            'text_logit_weight': float(top_weights[..., 0].mean().detach().cpu()),
+            'img_logit_weight': float(top_weights[..., 1].mean().detach().cpu()),
+        }
 
     def calculate_loss(self, interaction):
         if self.train_stage == 'pretrain':

@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="520" viewBox="0 0 820 520">
+<rect width="100%" height="100%" fill="white"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#222}.label{font-size:15px}.tick{font-size:12px;fill:#444}.title{font-size:18px;font-weight:700}.legend{font-size:14px}</style>
+<text class="title" x="410.0" y="26" text-anchor="middle">Weight vs Missing Ratio</text>
+<line x1="90" y1="435.00" x2="780" y2="435.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="439.00" text-anchor="end">0</text>
+<line x1="90" y1="357.00" x2="780" y2="357.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="361.00" text-anchor="end">0.058</text>
+<line x1="90" y1="279.00" x2="780" y2="279.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="283.00" text-anchor="end">0.115</text>
+<line x1="90" y1="201.00" x2="780" y2="201.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="205.00" text-anchor="end">0.173</text>
+<line x1="90" y1="123.00" x2="780" y2="123.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="127.00" text-anchor="end">0.231</text>
+<line x1="90" y1="45.00" x2="780" y2="45.00" stroke="#dddddd" stroke-width="1"/>
+<text class="tick" x="78" y="49.00" text-anchor="end">0.288</text>
+<line x1="90" y1="45" x2="90" y2="435" stroke="#222" stroke-width="1.4"/>
+<line x1="90" y1="435" x2="780" y2="435" stroke="#222" stroke-width="1.4"/>
+<line x1="90.00" y1="435" x2="90.00" y2="441" stroke="#222"/>
+<text class="tick" x="90.00" y="460" text-anchor="middle">0</text>
+<line x1="320.00" y1="435" x2="320.00" y2="441" stroke="#222"/>
+<text class="tick" x="320.00" y="460" text-anchor="middle">0.1</text>
+<line x1="550.00" y1="435" x2="550.00" y2="441" stroke="#222"/>
+<text class="tick" x="550.00" y="460" text-anchor="middle">0.2</text>
+<line x1="780.00" y1="435" x2="780.00" y2="441" stroke="#222"/>
+<text class="tick" x="780.00" y="460" text-anchor="middle">0.3</text>
+<text class="label" x="435.0" y="492" text-anchor="middle">missing_ratio</text>
+<text class="label" transform="translate(24 240.0) rotate(-90)" text-anchor="middle">weight</text>
+<polyline points="90.00,98.82 320.00,105.91 550.00,111.36 780.00,115.74" fill="none" stroke="#1f77b4" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="90.00" cy="98.82" r="5" fill="#1f77b4"/>
+<text class="tick" x="90.00" y="88.82" text-anchor="middle">0.249</text>
+<circle cx="320.00" cy="105.91" r="5" fill="#1f77b4"/>
+<text class="tick" x="320.00" y="95.91" text-anchor="middle">0.243</text>
+<circle cx="550.00" cy="111.36" r="5" fill="#1f77b4"/>
+<text class="tick" x="550.00" y="101.36" text-anchor="middle">0.239</text>
+<circle cx="780.00" cy="115.74" r="5" fill="#1f77b4"/>
+<text class="tick" x="780.00" y="105.74" text-anchor="middle">0.236</text>
+<polyline points="90.00,340.22 320.00,357.28 550.00,389.46 780.00,397.84" fill="none" stroke="#d62728" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="85.00" y="335.22" width="10" height="10" fill="#d62728"/>
+<text class="tick" x="90.00" y="330.22" text-anchor="middle">0.07</text>
+<rect x="315.00" y="352.28" width="10" height="10" fill="#d62728"/>
+<text class="tick" x="320.00" y="347.28" text-anchor="middle">0.057</text>
+<rect x="545.00" y="384.46" width="10" height="10" fill="#d62728"/>
+<text class="tick" x="550.00" y="379.46" text-anchor="middle">0.034</text>
+<rect x="775.00" y="392.84" width="10" height="10" fill="#d62728"/>
+<text class="tick" x="780.00" y="387.84" text-anchor="middle">0.027</text>
+<line x1="108" y1="67" x2="136" y2="67" stroke="#1f77b4" stroke-width="3"/>
+<circle cx="122" cy="67" r="5" fill="#1f77b4"/>
+<text class="legend" x="146" y="72">graph_adaptive_weight</text>
+<line x1="108" y1="91" x2="136" y2="91" stroke="#d62728" stroke-width="3"/>
+<rect x="117" y="86" width="10" height="10" fill="#d62728"/>
+<text class="legend" x="146" y="96">img_logit_weight</text>
+</svg>

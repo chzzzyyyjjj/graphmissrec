@@ -29,6 +29,13 @@ item_mm_fusion: dynamic_shared # static / dynamic_shared
 graph_fusion_alpha: 0.3 # try 0.1 / 0.3 / 0.5 / 1.0
 debug_fusion: False
 
+# Training-time modality missing simulation.
+# Set modality_missing_train_mode to text / img / both and use a positive
+# modality_missing_train_ratio to train and evaluate under fixed missing items.
+modality_missing_train_mode: none # none / text / img / both
+modality_missing_train_ratio: 0.0
+modality_missing_train_seed: 2026
+
 alpha: 0.05
 seq_seq_weight: 0.01
 num_heads: 5
